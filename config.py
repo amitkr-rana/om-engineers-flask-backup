@@ -1,11 +1,17 @@
 import os
 from pathlib import Path
+from datetime import timedelta
 
 # Build paths
 BASE_DIR = Path(__file__).resolve().parent
 
 class Config:
     SECRET_KEY = os.environ.get('SECRET_KEY') or 'om-engineers-secret-key-2024'
+
+    # Authentication configuration
+    AUTH_TOKEN_EXPIRY_HOURS = 24 * 30  # 30 days
+    MAX_AUTH_ATTEMPTS = 5  # Max failed authentication attempts
+    AUTH_RATE_LIMIT = 10  # Max auth requests per minute
 
     # Database configuration
     SQLALCHEMY_DATABASE_URI = os.environ.get('DATABASE_URL') or f'sqlite:///{BASE_DIR / "om_engineers.db"}'

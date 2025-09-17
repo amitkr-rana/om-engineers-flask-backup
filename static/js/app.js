@@ -366,7 +366,7 @@ function debounce(func, wait, immediate) {
 
 // Check if element is in viewport
 function isInViewport(element) {
-const rect = element.getBoundingClientRect();
+    const rect = element.getBoundingClientRect();
     return (
         rect.top >= 0 &&
         rect.left >= 0 &&

@@ -1,7 +1,9 @@
-from flask import Blueprint, request, jsonify, render_template, flash, redirect, url_for, session
+from flask import Blueprint, request, jsonify, render_template
 from services.otp_service import OTPService
+from services.auth_service import AuthService
 from models.otp import OTP
 from models.customer_db import Customer
+from utils.auth_decorators import get_auth_response_data
 from database import db
 from datetime import datetime
 
@@ -13,18 +15,11 @@ def send_otp():
     try:
         data = request.get_json() if request.is_json else request.form
         phone_number = data.get('phone_number', '').strip()
-        customer_name = data.get('customer_name', '').strip()
 
         if not phone_number:
             return jsonify({
                 'success': False,
                 'message': 'Phone number is required'
-            }), 400
-
-        if not customer_name:
-            return jsonify({
-                'success': False,
-                'message': 'Customer name is required'
             }), 400
 
         # Send OTP
@@ -43,73 +38,100 @@ def send_otp():
 
 @otp_bp.route('/verify', methods=['POST'])
 def verify_otp():
-    """Verify OTP code"""
+    """Verify OTP code and return authentication token"""
     try:
         data = request.get_json() if request.is_json else request.form
         phone_number = data.get('phone_number', '').strip()
         otp_code = data.get('otp_code', '').strip()
-        customer_name = data.get('customer_name', '').strip()
-
 
         if not phone_number or not otp_code:
             return jsonify({
                 'success': False,
-                'message': 'Phone number and OTP code are required'
-            }), 400
-
-        if not customer_name:
-            return jsonify({
-                'success': False,
-                'message': 'Customer name is required'
+                'message': 'Phone number and OTP code are required',
+                'error_code': 'MISSING_PARAMETERS'
             }), 400
 
         # Verify OTP
         success, message = OTPService.verify_otp(phone_number, otp_code)
 
         if success:
-            # Create or update customer record in database
-            try:
-                # Check if customer already exists by phone
-                existing_customer = Customer.get_by_phone(phone_number)
+            # Authenticate user after successful OTP verification
+            customer, token = AuthService.authenticate_after_otp(phone_number)
 
-                if existing_customer:
-                    # Update existing customer
-                    existing_customer.name = customer_name
-                    existing_customer.updated_at = datetime.utcnow()
-                    db.session.commit()
-                    customer = existing_customer
-                else:
-                    # Create new customer
-                    customer = Customer(
-                        name=customer_name,
-                        email=None,
-                        phone=phone_number,
-                        address=""
-                    )
-                    db.session.add(customer)
-                    db.session.commit()
+            if customer and token:
+                # Return authentication data with dashboard URL
+                auth_data = get_auth_response_data(customer, token)
+                auth_data['dashboard_url'] = f"/dashboard?token={token}"
+                auth_data['dashboard_url_with_key'] = f"/dashboard?auth_key={auth_data['customer']['auth_key']}"
 
-                # Store customer information in session
-                session['customer_id'] = customer.id
-                session['customer_phone'] = customer.phone
-
-            except Exception as e:
-                # Rollback any partial changes
-                db.session.rollback()
-
-                # Fallback - store in session only
-                session['customer_name'] = customer_name
-                session['customer_phone'] = phone_number
-
-        return jsonify({
-            'success': success,
-            'message': message
-        }), 200 if success else 400
+                return jsonify(auth_data), 200
+            else:
+                return jsonify({
+                    'success': False,
+                    'message': token or 'Authentication failed',
+                    'error_code': 'AUTH_FAILED'
+                }), 500
+        else:
+            return jsonify({
+                'success': False,
+                'message': message,
+                'error_code': 'OTP_INVALID'
+            }), 400
 
     except Exception as e:
         return jsonify({
             'success': False,
-            'message': f'Server error: {str(e)}'
+            'message': f'Server error: {str(e)}',
+            'error_code': 'SERVER_ERROR'
+        }), 500
+
+@otp_bp.route('/refresh-token', methods=['POST'])
+def refresh_token():
+    """Refresh authentication token for a logged-in user"""
+    try:
+        # Get current customer from token
+        customer = AuthService.get_customer_from_request(request)
+
+        if not customer:
+            return jsonify({
+                'success': False,
+                'message': 'Authentication required',
+                'error_code': 'AUTH_REQUIRED'
+            }), 401
+
+        # Generate new token
+        new_token = AuthService.refresh_token(customer)
+
+        return jsonify(get_auth_response_data(customer, new_token)), 200
+
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'message': f'Server error: {str(e)}',
+            'error_code': 'SERVER_ERROR'
+        }), 500
+
+@otp_bp.route('/logout', methods=['POST'])
+def logout():
+    """Logout user by revoking their authentication token"""
+    try:
+        # Get current customer from token
+        customer = AuthService.get_customer_from_request(request)
+
+        if customer:
+            # Revoke the token
+            AuthService.revoke_token(customer)
+
+        return jsonify({
+            'success': True,
+            'message': 'Logged out successfully'
+        }), 200
+
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'message': f'Server error: {str(e)}',
+            'error_code': 'SERVER_ERROR'
         }), 500
 
 @otp_bp.route('/resend', methods=['POST'])
@@ -155,6 +177,76 @@ def get_otp_status(phone_number):
         return jsonify({
             'success': False,
             'message': f'Server error: {str(e)}'
+        }), 500
+
+@otp_bp.route('/test-auth')
+def test_auth():
+    """Test authentication - shows current customer if authenticated"""
+    try:
+        print(f"Test auth request:")
+        print(f"  URL params: {request.args}")
+        print(f"  Headers: {dict(request.headers)}")
+
+        customer = AuthService.get_customer_from_request(request)
+        print(f"  Customer result: {customer}")
+
+        if customer:
+            from models.customer_auth import CustomerAuth
+            auth_record = CustomerAuth.query.filter_by(customer_id=customer.id).first()
+            print(f"  Auth record: {auth_record}")
+
+            return jsonify({
+                'success': True,
+                'message': 'Authentication successful',
+                'customer': customer.to_dict(),
+                'auth_info': auth_record.to_dict() if auth_record else None
+            }), 200
+        else:
+            return jsonify({
+                'success': False,
+                'message': 'Not authenticated',
+                'error_code': 'AUTH_REQUIRED'
+            }), 401
+
+    except Exception as e:
+        print(f"  Test auth exception: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({
+            'success': False,
+            'message': f'Error: {str(e)}',
+            'error_code': 'SERVER_ERROR'
+        }), 500
+
+@otp_bp.route('/debug-db')
+def debug_db():
+    """Debug database state"""
+    try:
+        from models.customer_auth import CustomerAuth
+        from models.customer_db import Customer
+
+        # Get all customers and their auth records
+        customers = Customer.query.all()
+        auth_records = CustomerAuth.query.all()
+
+        debug_info = {
+            'customers_count': len(customers),
+            'auth_records_count': len(auth_records),
+            'customers': [{'id': c.id, 'name': c.name, 'phone': c.phone} for c in customers],
+            'auth_records': [{'customer_id': a.customer_id, 'auth_key': a.auth_key, 'has_token': bool(a.auth_token)} for a in auth_records]
+        }
+
+        return jsonify({
+            'success': True,
+            'debug_info': debug_info
+        }), 200
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({
+            'success': False,
+            'error': str(e)
         }), 500
 
 @otp_bp.route('/test')
